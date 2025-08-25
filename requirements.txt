@@ -1,0 +1,20 @@
+# PyTorch + Audio (CUDA 12.2 build)
+torch==2.2.0
+torchaudio==2.2.0
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# HuggingFace + PhoWhisper
+transformers==4.55.2
+huggingface-hub==0.34.4
+accelerate
+
+# Audio processing
+librosa==0.10.2
+soundfile==0.12.1
+ffmpeg-python==0.2.0
+
+# Core utils
+numpy==2.2.6
+requests==2.32.5
+tqdm==4.67.1
+safetensors==0.6.2
