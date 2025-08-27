@@ -1,42 +1,44 @@
-# Base: Ubuntu 22.04 + CUDA 12.2 runtime
-FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+# ---------- Builder: deps, build venv ----------
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04 AS builder
 
-# Set tzdata non-interactive
-ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=Asia/Ho_Chi_Minh
+ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Ho_Chi_Minh \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-# --- Install Python 3.10.8 ---
-RUN apt-get update && apt-get install -y \
-    wget build-essential libssl-dev zlib1g-dev libbz2-dev \
-    libreadline-dev libsqlite3-dev curl libncursesw5-dev xz-utils \
-    tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev git ffmpeg \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3.10-venv python3-pip \
+    build-essential git ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /tmp
-RUN wget https://www.python.org/ftp/python/3.10.8/Python-3.10.8.tgz && \
-    tar xvf Python-3.10.8.tgz && \
-    cd Python-3.10.8 && \
-    ./configure --enable-optimizations && \
-    make -j$(nproc) && \
-    make altinstall && \
-    cd .. && rm -rf Python-3.10.8*
-
-# Symlink python3.10.8 → python3 & pip3
-RUN ln -sf /usr/local/bin/python3.10 /usr/bin/python3 && \
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
+# venv to separate system
+RUN python3.10 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-# Copy requirements
+# limit invalidation cache: copy each requirements before
 COPY requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Install deps
-RUN python3 -m pip install --upgrade pip && \
-    pip install -r requirements.txt
+# ---------- Runtime: minimal, no build tools ----------
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
-# Copy app code
+ENV DEBIAN_FRONTEND=noninteractive TZ=Asia/Ho_Chi_Minh \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    TRANSFORMERS_CACHE=/opt/hf-cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3-pip ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/hf-cache
+
+# copy venv from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /app
 COPY ./app ./app
 
 EXPOSE 8000
-
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -22,16 +22,17 @@ class WhisperModel(str, Enum):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 hf_device = 0 if device == "cuda" else -1
 
-# PhoWhisper model
-pho_whisper_model = pipeline(
-    "automatic-speech-recognition",
-    model="vinai/PhoWhisper-large",
-    device=hf_device,
-    torch_dtype=torch.float16 if device == "cuda" else None,
-)
+# # PhoWhisper model
+# pho_whisper_model = pipeline(
+#     "automatic-speech-recognition",
+#     model="vinai/PhoWhisper-large",
+#     device=hf_device,
+#     torch_dtype=torch.float16 if device == "cuda" else None,
+#     use_safetensors=True,
+# )
 
 # OpenAI Whisper model
-openai_whisper_model = whisper.load_model("large-v3-turbo", device=device)
+openai_whisper_model = whisper.load_model("large-v3", device=device)
 
 
 def transcribe_audio(
@@ -39,10 +40,18 @@ def transcribe_audio(
 ) -> str:
     """Transcribe audio using the specified model"""
     if model_type == WhisperModel.PHO_WHISPER:
-        result = pho_whisper_model(audio_data, sampling_rate=sample_rate)
-        return result["text"]
+        # result = pho_whisper_model(audio_data, sampling_rate=sample_rate)
+        # return result["text"]
+        pass
     elif model_type == WhisperModel.OPENAI_WHISPER:
-        result = openai_whisper_model.transcribe(audio_data)
+        # Ensure numpy float32 array
+        if not isinstance(audio_data, np.ndarray):
+            audio_np = np.array(audio_data, dtype=np.float32)
+        else:
+            audio_np = audio_data.astype(np.float32, copy=False)
+        # Let whisper handle device and mel shape internally
+        use_fp16 = openai_whisper_model.device.type == "cuda"
+        result = openai_whisper_model.transcribe(audio_np, fp16=use_fp16)
         return result["text"]
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
@@ -82,103 +91,70 @@ async def transcribe(
 async def handle_websocket_transcription(
     websocket: WebSocket, model_type: WhisperModel
 ):
-    """Common WebSocket handler for transcription"""
     await websocket.accept()
     audio_buffer = bytearray()
 
     try:
         while True:
-            message = await websocket.receive()
+            try:
+                message = await websocket.receive()
+            except (WebSocketDisconnect, RuntimeError):
+                break
 
             data_bytes = message.get("bytes")
             data_text = message.get("text")
 
             if data_bytes is not None:
-                # Accumulate audio bytes
                 audio_buffer.extend(data_bytes)
-                await websocket.send_json(
-                    {
-                        "status": "buffered",
-                        "buffer_bytes": len(audio_buffer),
-                        "model": model_type.value,
-                    }
-                )
                 continue
 
-            if data_text is not None:
-                text_cmd = data_text.strip().lower()
+            if data_text is not None and data_text.strip().lower() == "end":
+                if not audio_buffer:
+                    await websocket.send_json({"error": "no audio buffered"})
+                    continue
 
-                if text_cmd == "reset":
-                    audio_buffer.clear()
+                # Decode audio
+                try:
+                    with io.BytesIO(bytes(audio_buffer)) as wav_io:
+                        wav, sr = sf.read(wav_io)
+                except Exception:
+                    wav_np = np.frombuffer(bytes(audio_buffer), dtype=np.int16)
+                    wav = wav_np.astype(np.float32) / 32768.0
+                    sr = 16000
+
+                if sr != 16000:
                     await websocket.send_json(
-                        {"status": "reset", "model": model_type.value}
+                        {"error": f"audio must be 16kHz; got {sr}"}
                     )
-                    continue
-
-                if text_cmd == "end":
-                    if not audio_buffer:
-                        await websocket.send_json({"error": "no audio buffered"})
-                        continue
-
-                    wav: np.ndarray
-                    sr: int = 16000
-
-                    # Try to decode as WAV first
-                    try:
-                        with io.BytesIO(bytes(audio_buffer)) as wav_io:
-                            wav, sr = sf.read(wav_io)
-                    except Exception:
-                        # Fallback: assume raw PCM int16 LE mono @16kHz
-                        wav_np = np.frombuffer(bytes(audio_buffer), dtype=np.int16)
-                        wav = wav_np.astype(np.float32) / 32768.0
-                        sr = 16000
-
-                    # Validate and preprocess
-                    if sr != 16000:
-                        await websocket.send_json(
-                            {"error": "audio must be 16kHz; got %d" % sr}
-                        )
-                        audio_buffer.clear()
-                        continue
-
-                    if wav.ndim > 1:
-                        wav = np.mean(wav, axis=1)
-
-                    # Run transcription using selected model
-                    try:
-                        text = transcribe_audio(wav, sr, model_type)
-                        await websocket.send_json(
-                            {
-                                "text": text,
-                                "model": model_type.value,
-                                "sample_rate": sr,
-                                "duration": len(wav) / sr,
-                            }
-                        )
-                    except Exception as e:
-                        await websocket.send_json(
-                            {
-                                "error": f"Transcription failed: {str(e)}",
-                                "model": model_type.value,
-                            }
-                        )
-
-                    # Clear buffer for next session
                     audio_buffer.clear()
                     continue
 
-                # Unknown text command
-                await websocket.send_json(
-                    {
-                        "status": "ignored",
-                        "message": data_text,
-                        "model": model_type.value,
-                    }
-                )
+                if wav.ndim > 1:
+                    wav = np.mean(wav, axis=1)
 
-    except WebSocketDisconnect:
-        # Client disconnected; just exit gracefully
-        return
+                try:
+                    text = transcribe_audio(wav, sr, model_type)
+                    await websocket.send_json(
+                        {
+                            "text": text,
+                            "model": model_type.value,
+                            "sample_rate": sr,
+                            "duration": len(wav) / sr,
+                        }
+                    )
+                except Exception as e:
+                    await websocket.send_json(
+                        {"error": f"Transcription failed: {str(e)}"}
+                    )
+
+                audio_buffer.clear()
+                continue
+
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.websocket("/ws/whisper")
@@ -196,19 +172,19 @@ async def ws_whisper(websocket: WebSocket) -> None:
     await handle_websocket_transcription(websocket, WhisperModel.OPENAI_WHISPER)
 
 
-@app.websocket("/ws/pho")
-async def ws_pho(websocket: WebSocket) -> None:
-    """WebSocket endpoint for PhoWhisper transcription.
+# @app.websocket("/ws/pho")
+# async def ws_pho(websocket: WebSocket) -> None:
+#     """WebSocket endpoint for PhoWhisper transcription.
 
-    Protocol:
-    - Client sends binary frames containing audio bytes. You can stream either:
-      1) a complete WAV file split across frames, or
-      2) raw PCM 16-bit little-endian mono at 16 kHz.
-    - Send a text frame "END" to trigger transcription of buffered audio.
-    - Send a text frame "RESET" to clear the current buffer without transcribing.
-    - Server responds with JSON messages for status and final transcription.
-    """
-    await handle_websocket_transcription(websocket, WhisperModel.PHO_WHISPER)
+#     Protocol:
+#     - Client sends binary frames containing audio bytes. You can stream either:
+#       1) a complete WAV file split across frames, or
+#       2) raw PCM 16-bit little-endian mono at 16 kHz.
+#     - Send a text frame "END" to trigger transcription of buffered audio.
+#     - Send a text frame "RESET" to clear the current buffer without transcribing.
+#     - Server responds with JSON messages for status and final transcription.
+#     """
+#     await handle_websocket_transcription(websocket, WhisperModel.PHO_WHISPER)
 
 
 @app.get("/models")
@@ -228,7 +204,9 @@ async def get_available_models():
                     if model == WhisperModel.PHO_WHISPER
                     else "Multilingual Whisper model"
                 ),
-                "websocket_endpoint": f"/ws/{model.value.split('_')[0]}",
+                "websocket_endpoint": (
+                    "/ws/pho" if model == WhisperModel.PHO_WHISPER else "/ws/whisper"
+                ),
             }
             for model in WhisperModel
         ]
